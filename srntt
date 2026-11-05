@@ -1,0 +1,505 @@
+import asyncio
+import io
+import json
+import logging
+import os
+import tempfile
+import aiohttp
+from PIL import Image
+import yt_dlp
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message, CallbackQuery, BufferedInputFile, InputSticker,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.exceptions import TelegramBadRequest
+
+# ВСТАВЬТЕ ВАШ ТОКЕН СЮДА:
+TOKEN = "9005574452:AAG1dGOPwdSxKtapUOHMY-8kt-wNZGVtIvo"
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+USERS_FILE = "tiktok_users.json"
+URL_CACHE = {}  # Временное хранилище ссылок для кнопок
+
+
+def load_users() -> dict:
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_users(data: dict):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def format_static_image(image_bytes: bytes) -> bytes:
+    """Конвертирует картинку в статичный WEBP 512x512."""
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        img = img.convert("RGBA")
+        width, height = img.size
+        if width > height:
+            new_width, new_height = 512, max(1, int(512 * (height / width)))
+        else:
+            new_height, new_width = 512, max(1, int(512 * (width / height)))
+        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        img.save(output, format="WEBP", quality=95)
+        return output.getvalue()
+
+
+async def convert_to_webm(input_bytes: bytes) -> bytes:
+    """Конвертирует GIF/MP4 в видео-стикер Telegram (.webm, VP9)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, "input_media")
+        out_path = os.path.join(tmpdir, "output.webm")
+
+        with open(in_path, "wb") as f:
+            f.write(input_bytes)
+
+        cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-t", "00:00:02.9",
+            "-an",
+            "-vf", "scale=512:512:force_original_aspect_ratio=decrease,fps=30",
+            "-c:v", "libvpx-vp9",
+            "-b:v", "180k",
+            "-maxrate", "220k",
+            "-bufsize", "220k",
+            "-pix_fmt", "yuva420p",
+            "-auto-alt-ref", "0",
+            out_path
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await process.communicate()
+
+        if process.returncode != 0 or not os.path.exists(out_path):
+            raise RuntimeError(f"Ошибка FFmpeg: {stderr.decode(errors='ignore')[-300:]}")
+
+        with open(out_path, "rb") as f:
+            return f.read()
+
+
+def download_tiktok_no_watermark(url: str, cookies_path: str = None) -> bytes:
+    """
+    Скачивает видео из TikTok БЕЗ водяного знака (через yt-dlp + резервный API TikWM).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_tmpl = os.path.join(tmpdir, "video.%(ext)s")
+        ydl_opts = {
+            "outtmpl": out_tmpl,
+            # Приоритет потокам без водяного знака (download_addr)
+            "format": "bytevc1/h264/mp4/best",
+            "quiet": True,
+        }
+        if cookies_path and os.path.exists(cookies_path):
+            ydl_opts["cookiefile"] = cookies_path
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            for file in os.listdir(tmpdir):
+                file_path = os.path.join(tmpdir, file)
+                with open(file_path, "rb") as f:
+                    return f.read()
+        except Exception as e:
+            logging.warning(f"yt-dlp не справился ({e}), пробуем резервный метод...")
+
+    raise ValueError("Не удалось скачать видео по ссылке.")
+
+
+async def download_tiktok_fallback(url: str, cookies_path: str = None) -> bytes:
+    """Стабильное скачивание видео из TikTok без водяного знака через публичные шлюзы."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/"
+    }
+    
+    async with aiohttp.ClientSession(headers=headers) as session:
+        # Способ 1: Через официальный публичный API TikWM
+        try:
+            api_url = "https://www.tikwm.com/api/"
+            async with session.post(api_url, data={"url": url, "hd": 1}, timeout=20) as resp:
+                data = await resp.json()
+                if data.get("code") == 0 and data.get("data", {}):
+                    # Берем HD версию без водяного знака
+                    video_url = data["data"].get("hdplay") or data["data"].get("play")
+                    if video_url:
+                        async with session.get(video_url, timeout=30) as v_resp:
+                            if v_resp.status == 200:
+                                return await v_resp.read()
+        except Exception:
+            pass
+
+        # Способ 2: Резервный шлюз SnapTik API
+        try:
+            alt_api = f"https://tikwm.com/api/?url={url}"
+            async with session.get(alt_api, timeout=20) as resp:
+                data = await resp.json()
+                video_url = data.get("data", {}).get("play")
+                if video_url:
+                    async with session.get(video_url, timeout=30) as v_resp:
+                        if v_resp.status == 200:
+                            return await v_resp.read()
+        except Exception:
+            pass
+
+    raise ValueError("TikTok временно заблокировал этот запрос. Попробуйте отправить другую ссылку.")
+
+def fetch_user_favorites(username: str, count: int = 3, cookies_path: str = None) -> list[str]:
+    """Получает ссылки на последние избранные/понравившиеся видео из профиля TikTok."""
+    clean_user = username.lstrip("@").strip()
+    profile_url = f"https://www.tiktok.com/@{clean_user}"
+    ydl_opts = {
+        "extract_flat": True,
+        "playlistend": count,
+        "quiet": True,
+    }
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts["cookiefile"] = cookies_path
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(profile_url, download=False)
+        entries = info.get("entries") or []
+        return [entry.get("url") or entry.get("webpage_url") for entry in entries if entry]
+
+
+async def add_to_user_pack(user_id: int, file_bytes: bytes, sticker_format: str = "static", emoji: str = "🔥") -> str:
+    bot_info = await bot.get_me()
+    pack_name = f"tiktok_{user_id}_by_{bot_info.username}"
+    pack_title = "SRNTT TikTok Stickers"
+
+    ext = "webm" if sticker_format == "video" else "webp"
+    input_file = BufferedInputFile(file_bytes, filename=f"sticker.{ext}")
+
+    sticker = InputSticker(
+        sticker=input_file,
+        format=sticker_format,
+        emoji_list=[emoji]
+    )
+
+    try:
+        await bot.get_sticker_set(name=pack_name)
+        await bot.add_sticker_to_set(user_id=user_id, name=pack_name, sticker=sticker)
+    except TelegramBadRequest:
+        await bot.create_new_sticker_set(
+            user_id=user_id,
+            name=pack_name,
+            title=pack_title,
+            stickers=[sticker]
+        )
+
+    return pack_name
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user_name = message.from_user.first_name or "друг"
+    greeting_text = (
+        f"👋 <b>Привет, {user_name}! Добро пожаловать в SRNTT!</b>\n"
+        f"Я создаю стикерпаки прям из твоих избранных в тт. ✨\n\n"
+        f"🚀 <b>Что можно отправить боту:</b>\n"
+        f"• <b>Ссылку на TikTok</b> — я предложу скачать чистое видео или сделать из него видео-стикер!\n"
+        f"• <b>Фото, GIF или видео</b> — сразу превращу в стикер.\n\n"
+        f"🔗 <b>Привязка аккаунта TikTok:</b>\n"
+        f"👉 <code>/link @твой_ник</code> — привязать свой профиль TikTok\n(пока не работает)"
+        f"👉 /fav — взять последние ролики из твоего аккаунта и превратить их в стикеры!(пока не работает)\n\n"
+        f"📝 <b>Управление паком:</b>\n"
+        f"👉 /pack — ссылка на твой стикерпак\n"
+        f"👉 /del — удалить стикер (ответом на него)\n"
+        f"👉 /steal — забрать чужой стикер себе (ответом на него)\n"
+        f"👉 /help — все команды и инструкция"
+    )
+    await message.answer(greeting_text, parse_mode="HTML")
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "🛠 <b>Список всех команд SRNTT:</b>\n\n"
+        "🔗 <code>/link @username</code> — привязать TikTok-аккаунт\n"
+        "⭐️ /fav — создать стикеры из избранных видео привязанного аккаунта\n"
+        "📦 /pack — получить ссылку на мой стикерпак\n"
+        "🗑 /del — удалить стикер из набора (ответьте командой на стикер)\n"
+        "🕵️‍♂️ /steal — скопировать чужой стикер в свой пак\n\n"
+        "💡 <b>Как импортировать закрытые избранные из TikTok?</b>\n"
+        "Если раздел «Избранное» в TikTok приватный, отправьте боту файл <code>cookies.txt</code> (выгруженный из браузера расширением Get cookies.txt) с подписью <code>/cookies</code>.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("link"))
+async def cmd_link(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer(
+            "⚠️ Укажи свой ник в TikTok после команды!\n"
+            "Пример: <code>/link @durov</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    username = command.args.strip().lstrip("@")
+    users = load_users()
+    uid = str(message.from_user.id)
+    if uid not in users:
+        users[uid] = {}
+    users[uid]["username"] = username
+    save_users(users)
+
+    await message.answer(
+        f"✅ Аккаунт TikTok <b>@{username}</b> успешно привязан!\n\n"
+        f"Теперь ты можешь использовать команду /fav, чтобы автоматически делать стикеры из видео профиля.\n"
+        f"<i>(Для доступа к закрытой вкладке «Избранное» в браузере можно также загрузить файл cookies.txt с подписью /cookies)</i>.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.document, F.caption == "/cookies")
+async def handle_cookies_file(message: Message):
+    uid = str(message.from_user.id)
+    os.makedirs("cookies", exist_ok=True)
+    cookie_path = os.path.join("cookies", f"{uid}.txt")
+
+    file_info = await bot.get_file(message.document.file_id)
+    await bot.download_file(file_info.file_path, destination=cookie_path)
+
+    users = load_users()
+    if uid not in users:
+        users[uid] = {}
+    users[uid]["cookies"] = cookie_path
+    save_users(users)
+
+    await message.answer("🔐 Файл сессии <code>cookies.txt</code> сохранен! Теперь бот имеет доступ к твоим закрытым закладкам.", parse_mode="HTML")
+
+
+@dp.message(Command("fav"))
+async def cmd_fav(message: Message):
+    uid = str(message.from_user.id)
+    users = load_users()
+    user_data = users.get(uid, {})
+    username = user_data.get("username")
+    cookies_path = user_data.get("cookies")
+
+    if not username:
+        await message.answer(
+            "⚠️ Сначала привяжи свой TikTok аккаунт командой:\n"
+            "<code>/link @твой_ник</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    status = await message.answer(f"⏳ Загружаю последние медиа из аккаунта <b>@{username}</b>...", parse_mode="HTML")
+    try:
+        urls = await asyncio.to_thread(fetch_user_favorites, username, 3, cookies_path)
+        if not urls:
+            await status.edit_text(
+                "❌ Не удалось найти доступные ролики. Убедись, что профиль открыт, либо привяжи <code>cookies.txt</code> с подписью /cookies.",
+                parse_mode="HTML"
+            )
+            return
+
+        added = 0
+        pack_name = ""
+        for i, url in enumerate(urls, 1):
+            await status.edit_text(f"🎬 Обрабатываю {i} из {len(urls)} в стикерпак...")
+            raw_bytes = await download_tiktok_fallback(url, cookies_path)
+            webm_bytes = await convert_to_webm(raw_bytes)
+            pack_name = await add_to_user_pack(message.from_user.id, webm_bytes, "video")
+            added += 1
+
+        await status.edit_text(
+            f"✅ Готово! Добавлено <b>{added}</b> новых стикеров из аккаунта @{username}!\n"
+            f"👉 <a href='https://t.me/addstickers/{pack_name}'>Открыть стикерпак</a>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await status.edit_text(f"❌ Ошибка при синхронизации с аккаунтом: {e}")
+
+
+@dp.message(Command("pack"))
+async def cmd_pack(message: Message):
+    bot_info = await bot.get_me()
+    pack_name = f"tiktok_{message.from_user.id}_by_{bot_info.username}"
+    try:
+        sticker_set = await bot.get_sticker_set(name=pack_name)
+        count = len(sticker_set.stickers)
+        await message.answer(
+            f"📦 <b>Твой стикерпак:</b> <a href='https://t.me/addstickers/{pack_name}'>{sticker_set.title}</a>\n"
+            f"🔢 Стикеров внутри: <b>{count}</b> шт.",
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest:
+        await message.answer("У тебя пока нет стикерпака! Отправь мне любую картинку или ссылку на TikTok.")
+
+
+@dp.message(Command("del"))
+async def cmd_delete_sticker(message: Message):
+    if not message.reply_to_message or not message.reply_to_message.sticker:
+        await message.answer("⚠️ Ответь (Reply) командой /del на тот стикер, который нужно удалить.")
+        return
+
+    try:
+        await bot.delete_sticker_from_set(sticker=message.reply_to_message.sticker.file_id)
+        await message.answer("🗑 Стикер удален из твоего набора!")
+    except TelegramBadRequest as e:
+        await message.answer(f"❌ Не удалось удалить: {e}")
+
+
+@dp.message(Command("steal"))
+async def cmd_steal_sticker(message: Message):
+    if not message.reply_to_message or not message.reply_to_message.sticker:
+        await message.answer("⚠️ Ответь (Reply) командой /steal на любой чужой стикер, чтобы забрать его в свой пак!")
+        return
+
+    st = message.reply_to_message.sticker
+    if st.is_animated:
+        await message.answer("❌ Векторные TGS-стикеры пока не поддерживаются.")
+        return
+
+    status = await message.answer("🕵️‍♂️ Копирую стикер в твой пак...")
+    try:
+        file_info = await bot.get_file(st.file_id)
+        raw_bytes = (await bot.download_file(file_info.file_path)).read()
+        emoji = st.emoji or "🔥"
+        st_format = "video" if st.is_video else "static"
+
+        pack_name = await add_to_user_pack(message.from_user.id, raw_bytes, st_format, emoji)
+        await status.edit_text(f"✅ Стикер скопирован!\n👉 https://t.me/addstickers/{pack_name}")
+    except Exception as e:
+        await status.edit_text(f"❌ Ошибка: {e}")
+
+
+@dp.message(F.text.startswith("http"))
+async def handle_url(message: Message):
+    url = message.text.strip()
+
+    # Если это ссылка на TikTok — предлагаем выбор кнопками!
+    if "tiktok.com" in url:
+        cache_id = f"{message.from_user.id}_{message.message_id}"
+        URL_CACHE[cache_id] = url
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Скачать видео (без водяного знака)", callback_data=f"tt_dl:{cache_id}")],
+            [InlineKeyboardButton(text="✨ Сделать видео-стикер в пак", callback_data=f"tt_st:{cache_id}")]
+        ])
+        await message.answer("🎬 <b>Ссылка на TikTok распознана!</b>\nЧто делаем с этим видео?", reply_markup=kb, parse_mode="HTML")
+        return
+
+    # Для прямых ссылок на картинки или гифки
+    status_msg = await message.answer("⏳ Скачиваю файл по ссылке...")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=15) as resp:
+                raw_bytes = await resp.read()
+        if url.lower().endswith((".gif", ".mp4", ".webm", ".mov")):
+            webm_bytes = await convert_to_webm(raw_bytes)
+            pack_name = await add_to_user_pack(message.from_user.id, webm_bytes, "video")
+        else:
+            webp_bytes = format_static_image(raw_bytes)
+            pack_name = await add_to_user_pack(message.from_user.id, webp_bytes, "static")
+
+        await status_msg.edit_text(f"✅ Стикер готов!\n👉 https://t.me/addstickers/{pack_name}")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Не удалось обработать ссылку: {e}")
+
+
+@dp.callback_query(F.data.startswith("tt_"))
+async def handle_tiktok_callback(call: CallbackQuery):
+    action, cache_id = call.data.split(":", 1)
+    url = URL_CACHE.get(cache_id)
+
+    if not url:
+        await call.answer("⚠️ Ссылка устарела, отправь её ещё раз!", show_alert=True)
+        return
+
+    await call.answer()
+    uid = str(call.from_user.id)
+    cookies_path = load_users().get(uid, {}).get("cookies")
+
+    if action == "tt_dl":
+        await call.message.edit_text("📥 Скачиваю видео из TikTok без водяного знака...")
+        try:
+            video_bytes = await download_tiktok_fallback(url, cookies_path)
+            video_file = BufferedInputFile(video_bytes, filename="tiktok_srntt.mp4")
+            await call.message.answer_video(
+                video=video_file,
+                caption="🎬 Скачано без водяного знака через <b>SRNTT</b>",
+                parse_mode="HTML"
+            )
+            await call.message.delete()
+        except Exception as e:
+            await call.message.edit_text(f"❌ Не удалось скачать видео: {e}")
+
+    elif action == "tt_st":
+        await call.message.edit_text("✨ Скачиваю и конвертирую в видео-стикер (3–5 сек)...")
+        try:
+            video_bytes = await download_tiktok_fallback(url, cookies_path)
+            webm_bytes = await convert_to_webm(video_bytes)
+            pack_name = await add_to_user_pack(call.from_user.id, webm_bytes, "video")
+            await call.message.edit_text(
+                f"✅ Видео-стикер успешно добавлен!\n👉 <a href='https://t.me/addstickers/{pack_name}'>Открыть стикерпак</a>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await call.message.edit_text(f"❌ Ошибка создания стикера: {e}")
+
+
+@dp.message(F.photo)
+async def handle_photo(message: Message):
+    status_msg = await message.answer("⏳ Делаю обычный стикер...")
+    try:
+        file_info = await bot.get_file(message.photo[-1].file_id)
+        raw_bytes = (await bot.download_file(file_info.file_path)).read()
+        emoji = message.caption.strip()[0] if message.caption else "🔥"
+
+        webp_bytes = format_static_image(raw_bytes)
+        pack_name = await add_to_user_pack(message.from_user.id, webp_bytes, "static", emoji)
+        await status_msg.edit_text(f"✅ Стикер добавлен!\n👉 https://t.me/addstickers/{pack_name}")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка: {e}")
+
+
+@dp.message(F.animation | F.video | F.video_note | F.document)
+async def handle_video_or_gif(message: Message):
+    status_msg = await message.answer("🎬 Конвертирую в видео-стикер (3–5 секунд)...")
+    try:
+        media = message.animation or message.video or message.video_note or message.document
+        file_info = await bot.get_file(media.file_id)
+        raw_bytes = (await bot.download_file(file_info.file_path)).read()
+        emoji = message.caption.strip()[0] if message.caption else "🔥"
+
+        if message.document and message.document.mime_type and message.document.mime_type.startswith("image/") and "gif" not in message.document.mime_type:
+            webp_bytes = format_static_image(raw_bytes)
+            pack_name = await add_to_user_pack(message.from_user.id, webp_bytes, "static", emoji)
+        else:
+            webm_bytes = await convert_to_webm(raw_bytes)
+            pack_name = await add_to_user_pack(message.from_user.id, webm_bytes, "video", emoji)
+
+        await status_msg.edit_text(f"✅ Анимированный стикер добавлен!\n👉 https://t.me/addstickers/{pack_name}")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка: {e}")
+
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("✅ Бот SRNTT успешно запущен и готов к работе!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        import traceback
+        print("\n❌ ПРОИЗОШЛА ОШИБКА ПРИ ЗАПУСКЕ:")
+        traceback.print_exc()
+    input("\nНажмите Enter, чтобы закрыть это окно...")
